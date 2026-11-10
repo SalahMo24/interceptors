@@ -318,3 +318,57 @@ it('ignores extra internal arguments passed to .set() and .append()', () => {
     ['X-Append-Header', 'append-value'],
   ])
 })
+
+describe('multiple copies of this module', () => {
+  const kHeadersPatches = Symbol.for('@mswjs/interceptors/headers-patches')
+  const nativeSet = Headers.prototype.set
+
+  async function importFreshCopy() {
+    vi.resetModules()
+    return import('./record-raw-headers')
+  }
+
+  afterEach(async () => {
+    for (const patch of [...(Reflect.get(Headers, kHeadersPatches) ?? [])]) {
+      patch.restore()
+    }
+  })
+
+  it('replaces the patch of a copy from another realm instead of stacking on it', async () => {
+    const staleCopy = await importFreshCopy()
+    staleCopy.recordRawFetchHeaders()
+    // Jest gives each test file its own realm; mark this patch as coming from one.
+    Reflect.get(Headers, kHeadersPatches)[0].realm = {}
+
+    const copy = await importFreshCopy()
+    const restore = copy.recordRawFetchHeaders()
+
+    expect(Reflect.get(Headers, kHeadersPatches)).toHaveLength(1)
+    expect(
+      copy.getRawFetchHeaders(new Headers({ 'X-My-Header': '1' }))
+    ).toEqual([['X-My-Header', '1']])
+
+    restore()
+    expect(Headers.prototype.set).toBe(nativeSet)
+    expect(Reflect.has(Headers, kHeadersPatches)).toBe(false)
+  })
+
+  it('keeps the patches of two active copies in the same realm', async () => {
+    const first = await importFreshCopy()
+    const restoreFirst = first.recordRawFetchHeaders()
+    const second = await importFreshCopy()
+    const restoreSecond = second.recordRawFetchHeaders()
+
+    expect(Reflect.get(Headers, kHeadersPatches)).toHaveLength(2)
+
+    const headers = new Headers()
+    headers.set('X-My-Header', '1')
+    expect(first.getRawFetchHeaders(headers)).toEqual([['X-My-Header', '1']])
+    expect(second.getRawFetchHeaders(headers)).toEqual([['X-My-Header', '1']])
+
+    restoreSecond()
+    restoreFirst()
+    expect(Headers.prototype.set).toBe(nativeSet)
+    expect(Reflect.has(Headers, kHeadersPatches)).toBe(false)
+  })
+})

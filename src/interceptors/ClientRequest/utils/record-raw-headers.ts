@@ -7,6 +7,74 @@ type SetHeaderBehavior = 'set' | 'append'
 const kRawHeaders = Symbol('kRawHeaders')
 const kRestorePatches = Symbol('kRestorePatches')
 
+/**
+ * Patches applied by every copy of this module, shared through the global
+ * symbol registry. Test runners like Jest evaluate a fresh copy of this
+ * module in a new realm per test file, while all realms share the same
+ * `Headers` class, so a per-copy symbol cannot see earlier copies' patches.
+ */
+const kHeadersPatches = Symbol.for('@mswjs/interceptors/headers-patches')
+
+interface HeadersPatch {
+  realm: typeof globalThis
+  restore: () => void
+}
+
+function getHeadersPatches(): Array<HeadersPatch> | undefined {
+  return Reflect.get(Headers, kHeadersPatches)
+}
+
+function registerHeadersPatch(patch: HeadersPatch): void {
+  const patches = getHeadersPatches()
+
+  if (patches) {
+    patches.push(patch)
+    return
+  }
+
+  Object.defineProperty(Headers, kHeadersPatches, {
+    value: [patch],
+    enumerable: false,
+    configurable: true,
+  })
+}
+
+function unregisterHeadersPatch(patch: HeadersPatch): void {
+  const patches = getHeadersPatches()
+  const index = patches?.indexOf(patch) ?? -1
+
+  if (index === -1) {
+    return
+  }
+
+  patches!.splice(index, 1)
+
+  // Drop the list once empty: it belongs to the realm that created it.
+  if (patches!.length === 0) {
+    Reflect.deleteProperty(Headers, kHeadersPatches)
+  }
+}
+
+/**
+ * Restore the patches left by copies of this module that live in other
+ * realms (e.g. finished Jest test files). Stacking a new patch on top of
+ * them would keep every one of those realms reachable.
+ * Does nothing if a patch from this realm is still applied, so two
+ * active copies in the same realm keep working as before.
+ */
+function restorePatchesFromOtherRealms(): void {
+  const patches = getHeadersPatches()
+
+  if (!patches || patches.some((patch) => patch.realm === globalThis)) {
+    return
+  }
+
+  // Unwind from the newest patch so each restore puts back what it wrapped.
+  for (const patch of [...patches].reverse()) {
+    patch.restore()
+  }
+}
+
 function recordRawHeader(
   headers: Headers,
   args: HeaderTuple,
@@ -77,6 +145,8 @@ export function recordRawFetchHeaders(): () => void {
     return Reflect.get(Headers, kRestorePatches)
   }
 
+  restorePatchesFromOtherRealms()
+
   const {
     Headers: OriginalHeaders,
     Request: OriginalRequest,
@@ -84,8 +154,17 @@ export function recordRawFetchHeaders(): () => void {
   } = globalThis
   const { set, append, delete: headersDeleteMethod } = Headers.prototype
 
+  const patch: HeadersPatch = {
+    realm: globalThis,
+    restore: () => {
+      Reflect.get(OriginalHeaders, kRestorePatches)?.()
+    },
+  }
+
   Object.defineProperty(Headers, kRestorePatches, {
     value: () => {
+      unregisterHeadersPatch(patch)
+
       Headers.prototype.set = set
       Headers.prototype.append = append
       Headers.prototype.delete = headersDeleteMethod
@@ -108,6 +187,8 @@ export function recordRawFetchHeaders(): () => void {
      */
     configurable: true,
   })
+
+  registerHeadersPatch(patch)
 
   Object.defineProperty(globalThis, 'Headers', {
     enumerable: true,
